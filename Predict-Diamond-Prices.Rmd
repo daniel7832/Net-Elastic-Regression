@@ -1,0 +1,271 @@
+---
+title: "Predict Diamond Prices"
+output: 
+  html_document:
+    highlight: textmate
+    theme: spacelab
+    toc: yes
+    code_folding: hide
+    toc_depth: 3
+    toc_float: yes
+    includes:
+      in_header: "Data\\favicon.html"    
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+#knitr::opts_chunk$set(echo = F, warning = F, message = F)
+knitr::opts_chunk$set(warning = F, message = F)
+```
+
+```{r libraries}
+# load libraries
+library(tidyverse)
+library(readxl)
+library(knitr)
+library(scales)
+library(ggplot2)
+library(DT)
+library(bit64)
+library(psych)
+library(kableExtra)
+library(skimr)
+library(glmnet)
+library(caTools)
+library(xfun)
+library(openxlsx)
+library(randomForest)
+library(gbm)
+library(rpart)
+library(caret)
+
+# prevent scientific notation
+options(scipen = 999)
+```
+
+# Introduction
+
+The diamond market is unique. Most people don't buy diamonds on a regular basis and when they do, it can potentially be a big investment. The purpose for the following is to shed some light on the market for diamonds and demonstrate how to leverage R to gather educated insights. Diamond data comes from ggplot2. Just as any data-driven project ought to begin, the journey began through data cleaning and exploration. This included changing variable type, creating a new variable, and visualizations of single covariates in the form of histograms as well as multiple correlation plots to see interactions between the various predictor/response variables. As the human eyes are better at catching some patterns that computers simply cannot see, this strategy allowed to quickly find variables that needed transformations as well as where there were redundancies in the information provided by different variables like multicollinearity and spotting outliers.
+
+# Overview
+
+See [link](https://ggplot2.tidyverse.org/reference/diamonds.html "Click for additional information.") for data dictionary. Here's a sample of the first 10 rows. In the diamond business, the 4 Cs are used to make valuations. They are carat, cut, color, and clarity. A few other predictors that may be useful are provided. Price of diamond is the target variable. 
+
+```{r data_view}
+# show data in environment window
+diamonds = diamonds
+
+# show the first 10 rows of the data, exclude row names
+kable(head(diamonds, n=10)) %>% 
+  kable_styling('striped') 
+```
+
+The data consists of 53,940 rows and 10 columns. Cut, color, and clarity are factors. Price is integer and the rest are numeric. 
+
+```{r, str}
+# structure 
+str(diamonds)
+```
+
+There's no missing data.
+
+```{r missing_data}
+# find count of missing values per column
+apply(diamonds, function(x) sum(is.na(x)), MARGIN=2)
+```
+
+# Cleaning and Exploration 
+
+Cut is a factor variable. It ranges from Fair being the least desirable cut with a value of 1 and Ideal being the best and corresponding to 5^[\*](https://www.diamonds.pro/education/cuts/ "Click for additional information.")^. Converted to numeric for ease of use.
+
+```{r cut}
+unique(diamonds$cut)
+diamonds$cut = as.numeric(diamonds$cut)
+```
+
+Color is a factor variable. It ranges from J being the least desirable color with a value of 1 and D being the best and corresponding to 7^[\*](https://www.gia.edu/gia-about/4cs-color "Click for additional information.")^. Converted to numeric for ease of use and reversed original factor order for consistency.
+
+```{r color}
+unique(fct_rev(diamonds$color))
+diamonds$color = as.numeric(fct_rev(diamonds$color))
+```
+
+Clarity is a factor variable. It ranges from I1 being the least desirable color with a value of 1 and IF being the best and corresponding to 8^[\*](https://www.gia.edu/gia-about/4cs-clarity "Click for additional information.")^. Converted to numeric for ease of use.
+
+```{r clarity}
+unique(diamonds$clarity)
+diamonds$clarity = as.numeric(diamonds$clarity)
+```
+
+# Data visualization
+
+The table below shows that there are 10 variables. Skew values are high for carat, price, y, and z. Skewness values close to zero tend to have a symmetrical distribution. Kurtosis is high for carat, depth, table, price, y, and z. Dimensions x, y and z have correlations close to 1 (not shown in table). Dimension x was kept over y and z because its shape is closer to a normal distribution. x has some dimensions that are zero. These were removed, which resulted in 8 less observations. Diamonds with carats over 3 were also removed. This accounted for 32 observations. It's a small amount and not representative of the typical diamond.
+
+```{r describe}
+kable(round(describe(diamonds, ranges=F), digits=2)) %>% 
+  kable_styling('striped') 
+
+diamonds = diamonds %>% 
+  dplyr::filter(x > 0 & carat <= 3)
+```
+
+# Transformed Variables
+
+As you can see in the following plots, there were many highly right-skewed variables. Thusly, we needed to transform those particular predictor variables through mostly logarithm transforms (other transforms were used as well), to create more bell-shaped distributions. This is motivated by the fact that most linear model theory (as well as some algorithmic approaches, such as boosted decision trees) assumes normality in the data for asymptotic theory to hold, as well as the fact that we do not want certain variables to have more “leverage” than others simply due to extremely large values that do not necessarily contain more signal. This skewed phenomena is to be expected when dealing with price-type data, and this data is no different. The ordinal variables were not transformed because their values are relatively low. 
+
+```{r transform_setup}
+diamonds$y = NULL
+diamonds$z = NULL
+pairs.panels(diamonds, pch='.', stars=T, lm=T, ellipses=F, jiggle=T, cex.labels=1)
+```
+
+Another important aspect of data exploration is finding correlations between the predictor variables as well as with the response variables. From ridge regression theory, we know that multicollinearity can cause particularly wild behavior if two variables are included in a linear model which have high correlation.  Thus, discovering these multicollinearities allows us to identify redundancies in the information provided by these explanatory variables and implement appropriate variable selection. Before making the correlation plot below, price, carats, depth, table, and x were transformed to make their histograms look more normal. Log, square root, and reciprocal functions were used in transformations. Other transformations were considered. Pairs of variables with an absolute correlation value greater than or equal to 0.70 were considered to be strong. From this analysis reciprocal x, y, and z were highly correlated. Only x was included for modeling purposes. Price, x and carat look more like normal distributions. The distributions of these three variables are double peaked. This may be an indication that there are two populations present in the data--one for lower priced diamonds and another for more expensive ones. This line of thinking was not pursued further. Depth and table are less peaked and thereby are closer to a normal distribution. 
+
+```{r transforms}
+diamonds=diamonds %>% 
+  mutate(LogPrice=log(price),
+         LogCarat=log(carat),
+         InvCut=1/cut^(2/3),
+         SqrtDepth=sqrt(depth),
+         InvTable=1/table,
+         SqrtX=sqrt(x))
+
+diamonds0 = diamonds %>% dplyr::select(LogPrice, LogCarat, cut, SqrtDepth, InvTable, SqrtX, color, clarity)
+
+pairs.panels(diamonds0, pch='.', stars=T, lm=T, ellipses=F, jiggle=T, cex.labels=1)
+```
+
+# Modeling
+
+The data were broken down into a training and test set using 70-30 split. Regression and tree based models were used to model price as target variable with all other variables in the above figure as predictors. The table below shows that random forest was the best model using root mean squared error as selection criteria. Also, standard error is the minimum for the winning model.
+
+```{r model, set.seed(1)}
+# break the data into training and test
+DfCut = sample.split(diamonds0$LogPrice, SplitRatio=.7)
+train = diamonds0[DfCut,]
+test = diamonds0[!DfCut,]
+
+# lasso regression
+cvModel = cv.glmnet(x=as.matrix(train[,-1]), y=as.matrix(train[,1]), alpha=1)
+LassoModel = glmnet(x=as.matrix(train[,-1]), y=as.matrix(train[,1]), alpha=1, lambda=cvModel$lambda.min)
+yTestPricePredict = as.vector(predict(LassoModel, s=cvModel$lambda.min, newx=as.matrix(test[,-1])))
+rmse = sqrt(mean((as.matrix(test[,1]) - yTestPricePredict)^2))
+se = sd((as.matrix(test[,1]) - yTestPricePredict)^2)/sqrt(length(yTestPricePredict))
+models = data.frame(Model='Lasso Regression', RMSE=rmse, SE=se)
+
+# linear model
+cvModel = lm(LogPrice~., data=train)
+yTestPricePredict = as.vector(predict(cvModel, test[,-1]))
+rmse = sqrt(mean((as.matrix(test[,1]) - yTestPricePredict)^2))
+se = sd((as.matrix(test[,1]) - yTestPricePredict)^2)/sqrt(length(yTestPricePredict))
+models[nrow(models) + 1,] = c('Linear Regression', rmse, se)
+
+# ridge regression for
+cvModel = cv.glmnet(x=as.matrix(train[,-1]), y=as.matrix(train[,1]), alpha=0)
+LassoModel = glmnet(x=as.matrix(train[,-1]), y=as.matrix(train[,1]), alpha=0, lambda=cvModel$lambda.min)
+yTestPricePredict = as.vector(predict(LassoModel, s=cvModel$lambda.min, newx=as.matrix(test[,-1])))
+rmse = sqrt(mean((as.matrix(test[,1]) - yTestPricePredict)^2))
+se = sd((as.matrix(test[,1]) - yTestPricePredict)^2)/sqrt(length(yTestPricePredict))
+models[nrow(models) + 1,] = c('Ridge Regression', rmse, se)
+
+# net elastic regression 
+cvModel = cv.glmnet(x=as.matrix(train[,-1]), y=as.matrix(train[,1]), alpha=.5)
+LassoModel = glmnet(x=as.matrix(train[,-1]), y=as.matrix(train[,1]), alpha=.5, lambda=cvModel$lambda.min)
+yTestPricePredict = as.vector(predict(LassoModel, s=cvModel$lambda.min, newx=as.matrix(test[,-1])))
+rmse = sqrt(mean((as.matrix(test[,1]) - yTestPricePredict)^2))
+se = sd((as.matrix(test[,1]) - yTestPricePredict)^2)/sqrt(length(yTestPricePredict))
+models[nrow(models) + 1,] = c('Net Elastic Regression', rmse, se)
+
+# decision trees 
+fit = rpart(LogPrice~., data=train, control=rpart.control(cp=0.00001))
+yTestPricePredict = predict(fit, test[,-1])
+rmse = sqrt(mean((as.matrix(test[,1]) - yTestPricePredict)^2))
+se = sd((as.matrix(test[,1]) - yTestPricePredict)^2)/sqrt(length(yTestPricePredict))
+models[nrow(models) + 1,] = c('Decision Trees', rmse, se)
+
+# gradient boosting
+fit = gbm(LogPrice ~., 
+          data=train, 
+          distribution="gaussian", 
+          cv.folds=10,
+          interaction.depth=5, 
+          shrinkage=0.01, 
+          n.trees=1000,
+          set.seed(1))
+yTestPricePredict = predict(fit, test[,-1])
+rmse = sqrt(mean((as.matrix(test[,1]) - yTestPricePredict)^2))
+se = sd((as.matrix(test[,1]) - yTestPricePredict)^2)/sqrt(length(yTestPricePredict))
+models[nrow(models) + 1,] = c('Gradient Boosting', rmse, se)
+
+# random forest 
+set.seed(1)
+fit = randomForest(LogPrice ~ ., data=train, ntree=100, set.seed(1))
+yTestPricePredict = predict(fit, test[,-1])
+rmse = sqrt(mean((as.matrix(test[,1]) - yTestPricePredict)^2))
+se = sd((as.matrix(test[,1]) - yTestPricePredict)^2)/sqrt(length(yTestPricePredict))
+models[nrow(models) + 1,] = c('Random Forest', rmse, se)
+
+models$RMSE = round(as.numeric(models$RMSE), 4)
+models$SE = round(as.numeric(models$SE), 6)
+
+kable(models) %>% 
+  kable_styling('striped') 
+```
+
+The histogram below shows the distribution of the ratio of actual prices to predicted. Ratios close to 1 represent actual prices that are close to predicted values. While the histogram is centered at 1, there's a long tail on the right side. That means the model can under predict price more often and by a larger amount than over predict. There are likely models that perform better.
+
+```{r ratios}
+# predict on test data, compare ratio of actual price to predicted
+x = cbind(test[,1], yTestPricePredict)
+x$Price = exp(x$LogPrice)
+x$TestPrice = exp(x$yTestPricePredict)
+x$ActualToPredicted = x$Price/x$TestPrice
+
+ggplot(x, aes(x=ActualToPredicted)) + 
+  geom_histogram() +
+  xlab('Ratio of Actual to Test Price') +
+  ylab('Frequency')  +
+  ggtitle('Ratios tend to be centered around 1')
+```
+
+Below we see that x and carat are the most important variables. They seem to be the most relevant for diamonds and are both related to size. Recall that x represents the length of the diamond. This seems to be more important than the width (y) or depth (z) of a diamond. A diamond that is too wide or deep may not feel comfortable. Carat is important in predicting price because the higher the carat the more rare it is. In the diamond business, rarity commands higher prices. There's also more labor involved. One has to comb through a lot more material to find higher carat natural diamonds. As shown in the data dictionary above depth is a calculated field that depends on x, y, and z. Table depends on width (y). Since x is an important variable, depth and table are not as much because part of the predictive power of dimension was explained better by x. Clarity, color, and cut are not as important as predicting prices. Given the right length and carat of a diamond, discerning consumers may be willing to compromise on clarity, color, and cut to stay within budget. 
+
+```{r}
+# get variable importance scores
+ImpScores = varImp(fit, conditional=T) %>% 
+  rownames_to_column("Predictor") 
+ImpScores$Predictor = factor(ImpScores$Predictor,
+                                levels=rev(c('cut','SqrtDepth','InvTable','color','clarity',
+                                         'LogCarat','SqrtX')))
+
+#Plotting the bar and polar charts for comparing variables 
+ggplot(data=ImpScores, aes(x=Predictor, y=Overall)) + 
+  geom_bar(stat="identity")+
+  ggtitle('SqrtX and LogCarat are the most important predictors')
+```
+
+# Conclusion
+
+Based on the results of the model, it is clear that the decision trees methods outperformed regression techniques. This may be due to the structure of the data, as we know that trees divide the sample space into regions using linear discriminants orthogonal to the axes.  While easier to interpret, decision trees may have less predictive accuracy compared to other techniques for certain applications and different functional structures of data. 
+
+However, the random forest method improves prediction accuracy in decision trees. This is evident in our results as the random forest approach outperformed  regression models. The average vote process of this approach provided a wisdom of the crowd advantage that was superior to other models. The low root mean squared error for random forest model provided a reliable model to predict diamond prices. The selected highest performing model will significantly improve the ability to quickly and efficiently price diamonds than a manual approach. 
+
+# Limitations
+
+Here are some limitations encountered while completing this analysis. Most can be attributed to time and compute constraints.
+
+- Time sensitive data. Prices become stale over time. Model should be retrained and optimized periodically to adapt it to changing market preferences.
+- Outliers were determined visually using graphs. More robust methods may be useful.
+- Model diagnostics were not performed.
+- External market variables are missing. Diamond prices are based on internal and external factors. Macro factors such as unemployment and demand should be taken into account.  
+- More types of transformations should have been considered.
+- Lack of hyperparameter tuning via grid search.
+- No ensemble methods.
+- Warning sign on mice algorithm used to impute missing data was not looked into.
+
+```{css media, echo=F}
+@media print{
+  #TOC{display: none;}
+}
+```
